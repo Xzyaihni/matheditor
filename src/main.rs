@@ -171,6 +171,14 @@ impl From<Rect> for RenderRect
     }
 }
 
+impl RenderRect
+{
+    pub fn empty() -> Self
+    {
+        Self{x: 0, y: 0, width: 0, height: 0}
+    }
+}
+
 struct RenderResult<'a>
 {
     rect: RenderRect,
@@ -210,6 +218,16 @@ impl<'a> RenderResult<'a>
             self.rect.width += other.rect.width;
             self.rect.height = self.rect.height.max(other.rect.height);
         }
+
+        self.render.extend(other.render);
+
+        self
+    }
+
+    pub fn combine_vertical(mut self, other: RenderResult<'a>) -> Self
+    {
+        self.rect.width = self.rect.width.max(other.rect.width);
+        self.rect.height += other.rect.height;
 
         self.render.extend(other.render);
 
@@ -324,10 +342,12 @@ impl InputValues
     {
         self.traverse_mut(cursor, |this, cursor|
         {
-            let index = cursor.index - 1;
-            let value = mem::take(&mut this.0[index]);
+            if let Some(index) = cursor.index.checked_sub(1)
+            {
+                let value = mem::take(&mut this.0[index]);
 
-            this.0[index] = InputValue::Fraction{top: Self(vec![value]), bottom: Self(Vec::new())};
+                this.0[index] = InputValue::Fraction{top: Self(vec![value]), bottom: Self(Vec::new())};
+            }
         });
     }
 
@@ -501,7 +521,7 @@ impl InputValues
         &self,
         cursor: &mut ValueCursor,
         which: CursorFollow
-    )
+    ) -> bool
     {
         if let Some((direction, follow)) = cursor.follow.as_mut()
         {
@@ -532,7 +552,11 @@ impl InputValues
                     {
                         unreachable!()
                     }
+
+                    return true;
                 }
+
+                false
             } else
             {
                 match (this, direction)
@@ -548,17 +572,20 @@ impl InputValues
                     (InputValue::Value(_), _) => unreachable!()
                 }
             }
+        } else
+        {
+            false
         }
     }
 
-    pub fn move_up(&self, cursor: &mut ValueCursor)
+    pub fn move_up(&self, cursor: &mut ValueCursor) -> bool
     {
-        self.move_vertical(cursor, CursorFollow::Bottom);
+        self.move_vertical(cursor, CursorFollow::Bottom)
     }
 
-    pub fn move_down(&self, cursor: &mut ValueCursor)
+    pub fn move_down(&self, cursor: &mut ValueCursor) -> bool
     {
-        self.move_vertical(cursor, CursorFollow::Top);
+        self.move_vertical(cursor, CursorFollow::Top)
     }
 
     pub fn render(
@@ -641,7 +668,10 @@ impl ValueCursor
             follow.add_fraction();
         } else
         {
-            self.follow = Some((CursorFollow::Bottom, Box::new(Self::default())));
+            if self.index != 0
+            {
+                self.follow = Some((CursorFollow::Bottom, Box::new(Self::default())));
+            }
         }
     }
 
@@ -657,18 +687,28 @@ impl ValueCursor
     }
 }
 
+struct Cursor
+{
+    line: usize,
+    value: ValueCursor
+}
+
 struct ProgramState<'a>
 {
     font: Font<'a, 'static>,
-    cursor: ValueCursor,
-    values: InputValues
+    cursor: Cursor,
+    lines: Vec<InputValues>
 }
 
 impl<'a> ProgramState<'a>
 {
     pub fn new(font: Font<'a, 'static>) -> Self
     {
-        Self{font, cursor: ValueCursor::default(), values: InputValues(Vec::new())}
+        Self{
+            font,
+            cursor: Cursor{line: 0, value: ValueCursor::default()},
+            lines: vec![InputValues::default()]
+        }
     }
 
     pub fn add_text(&mut self, text: String)
@@ -680,53 +720,140 @@ impl<'a> ProgramState<'a>
         }
     }
 
+    pub fn new_line(&mut self)
+    {
+        if self.cursor.value.follow.is_some()
+        {
+            return;
+        }
+
+        let rest = self.lines[self.cursor.line].0.split_off(self.cursor.value.index);
+
+        self.cursor.line += 1;
+        self.cursor.value = ValueCursor::default();
+
+        self.lines.insert(self.cursor.line, InputValues(rest));
+    }
+
     fn add_normal(&mut self, text: String)
     {
-        self.values.add_text(&self.cursor, text);
-        self.cursor.added();
+        self.lines[self.cursor.line].add_text(&self.cursor.value, text);
+        self.cursor.value.added();
     }
 
     fn add_fraction(&mut self)
     {
-        self.values.add_fraction(&self.cursor);
-        self.cursor.add_fraction();
+        self.lines[self.cursor.line].add_fraction(&self.cursor.value);
+        self.cursor.value.add_fraction();
     }
 
     pub fn remove_single(&mut self)
     {
-        self.values.remove_single(&mut self.cursor);
+        if self.cursor.value.follow.is_none() && self.cursor.value.index == 0
+        {
+            if self.lines.len() == 1
+            {
+                return;
+            }
+
+            let previous = self.lines.remove(self.cursor.line);
+
+            self.cursor.line -= 1;
+
+            self.cursor.value.follow = None;
+            self.cursor.value.index = self.lines[self.cursor.line].0.len();
+
+            self.lines[self.cursor.line].0.extend(previous.0);
+        } else
+        {
+            self.lines[self.cursor.line].remove_single(&mut self.cursor.value);
+        }
+    }
+
+    pub fn remove_next_single(&mut self)
+    {
+        let line_length = self.lines[self.cursor.line].0.len();
+        if self.cursor.value.follow.is_none() && self.cursor.value.index == line_length
+        {
+            if self.lines.len() - 1 > self.cursor.line
+            {
+                let line = self.lines.remove(self.cursor.line + 1);
+
+                self.lines[self.cursor.line].0.extend(line.0);
+            }
+        } else
+        {
+            self.move_right();
+            self.remove_single();
+        }
     }
 
     pub fn move_left(&mut self)
     {
-        self.values.move_left(&mut self.cursor);
+        self.lines[self.cursor.line].move_left(&mut self.cursor.value);
     }
 
     pub fn move_right(&mut self)
     {
-        self.values.move_right(&mut self.cursor);
+        self.lines[self.cursor.line].move_right(&mut self.cursor.value);
+    }
+
+    fn truncate_index(&mut self)
+    {
+        self.cursor.value.index = self.cursor.value.index.min(self.lines[self.cursor.line].0.len());
     }
 
     pub fn move_up(&mut self)
     {
-        self.values.move_up(&mut self.cursor);
+        if !self.lines[self.cursor.line].move_up(&mut self.cursor.value)
+        {
+            if self.cursor.line > 0
+            {
+                self.cursor.line -= 1;
+                self.truncate_index();
+            }
+        }
     }
 
     pub fn move_down(&mut self)
     {
-        self.values.move_down(&mut self.cursor);
+        if !self.lines[self.cursor.line].move_down(&mut self.cursor.value)
+        {
+            if self.cursor.line < self.lines.len() - 1
+            {
+                self.cursor.line += 1;
+                self.truncate_index();
+            }
+        }
     }
 
     pub fn render(
         &self,
-        y: i32,
+        width: u32,
+        height: u32,
         f: impl Fn(RenderValue) -> RenderResult,
         renderer: impl FnMut(&RenderValue)
     )
     {
-        let x = 0;
+        let start = RenderRect::empty();
+        let mut render = self.lines.iter().enumerate()
+            .fold(RenderResult::empty(start), |acc, (index, line)|
+            {
+                let cursor = (self.cursor.line == index).then_some(&self.cursor.value);
 
-        let render = self.values.render(Some(&self.cursor), x, y, &f);
+                let y = acc.rect.y + acc.rect.height as i32;
+                acc.combine_vertical(line.render(cursor, 0, y, &f))
+            });
+
+        let center = |size, start, other_size|
+        {
+            start + (size as i32 - other_size as i32) / 2
+        };
+
+        let x = center(width, render.rect.x, render.rect.width);
+        let y = center(height, render.rect.y, render.rect.height);
+
+        render.shift(x, y);
 
         render.render(renderer);
     }
@@ -759,8 +886,8 @@ fn main()
 
         canvas.set_draw_color(Color::RGB(0, 0, 0));
 
-        let draw_height = canvas.window().size().1 as i32 / 2 - FONT_SIZE as i32 / 2;
-        state.render(draw_height, |render|
+        let (width, height) = canvas.window().size();
+        state.render(width, height, |render|
         {
             let rect = match render
             {
@@ -841,8 +968,11 @@ fn main()
                     },
                     Keycode::DELETE =>
                     {
-                        state.move_right();
-                        state.remove_single();
+                        state.remove_next_single();
+                    },
+                    Keycode::RETURN =>
+                    {
+                        state.new_line();
                     },
                     Keycode::LEFT =>
                     {
