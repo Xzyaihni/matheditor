@@ -872,6 +872,16 @@ impl<'a> ProgramState<'a>
 
         render.shift(x, y);
 
+        if render.rect.y < 0
+        {
+            render.shift(0, render.rect.y);
+        }
+
+        if render.rect.x < 0
+        {
+            render.shift(render.rect.x, 0);
+        }
+
         render.render(renderer);
     }
 }
