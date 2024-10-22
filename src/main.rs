@@ -1,4 +1,4 @@
-use std::mem;
+use std::{cell::RefCell, mem};
 
 use sdl2::{
     rect::Rect,
@@ -25,12 +25,12 @@ impl RenderValue<'_>
 {
     pub fn new_cursor(x: i32, y: i32) -> Self
     {
-        Self::Cursor{x, y}
+        Self::Cursor{x, y: y - FONT_SIZE as i32 / 2}
     }
 
     pub fn new_cursor_rect(rect: RenderRect) -> Self
     {
-        Self::new_cursor(rect.x + rect.width as i32, rect.y)
+        Self::new_cursor(rect.x + rect.width as i32, rect.y + rect.height as i32 / 2)
     }
 
     pub fn shift(&mut self, shift_x: i32, shift_y: i32)
@@ -134,7 +134,7 @@ impl InputValue
                     f(RenderValue::Line{x, y, width})
                 };
 
-                let rect = Rect::new(x, top.rect.y, width, top.rect.height + bottom.rect.height).into();
+                let rect = bottom.rect.combine(top.rect);
 
                 let mut render = top.render;
                 render.extend(bottom.render);
@@ -177,6 +177,24 @@ impl RenderRect
     {
         Self{x: 0, y: 0, width: 0, height: 0}
     }
+
+    fn end(self) -> (i32, i32)
+    {
+        (self.x + self.width as i32, self.y + self.height as i32)
+    }
+
+    pub fn combine(self, other: Self) -> Self
+    {
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+
+        let this_end = self.end();
+        let other_end = other.end();
+        let end_x = this_end.0.max(other_end.0);
+        let end_y = this_end.1.max(other_end.1);
+
+        Self{x, y, width: (end_x - x) as u32, height: (end_y - y) as u32}
+    }
 }
 
 struct RenderResult<'a>
@@ -215,19 +233,8 @@ impl<'a> RenderResult<'a>
     {
         if !other.is_cursor()
         {
-            self.rect.width += other.rect.width;
-            self.rect.height = self.rect.height.max(other.rect.height);
+            self.rect = self.rect.combine(other.rect);
         }
-
-        self.render.extend(other.render);
-
-        self
-    }
-
-    pub fn combine_vertical(mut self, other: RenderResult<'a>) -> Self
-    {
-        self.rect.width = self.rect.width.max(other.rect.width);
-        self.rect.height += other.rect.height;
 
         self.render.extend(other.render);
 
@@ -236,6 +243,9 @@ impl<'a> RenderResult<'a>
 
     pub fn shift(&mut self, x: i32, y: i32)
     {
+        self.rect.x += x;
+        self.rect.y += y;
+
         self.render.iter_mut().for_each(|r| r.shift(x, y));
     }
 
@@ -600,7 +610,7 @@ impl InputValues
 
         if let Some(ValueCursor{index: 0, follow: None}) = cursor
         {
-            start = start.combine(f(RenderValue::new_cursor(x, y)));
+            start = start.combine(f(RenderValue::new_cursor(x, y + FONT_SIZE as i32 / 2)));
         }
 
         self.0.iter().enumerate().fold(start, |acc, (index, value)|
@@ -807,7 +817,7 @@ impl<'a> ProgramState<'a>
     {
         if !self.lines[self.cursor.line].move_up(&mut self.cursor.value)
         {
-            if self.cursor.line > 0
+            if self.cursor.value.follow.is_none() && self.cursor.line > 0
             {
                 self.cursor.line -= 1;
                 self.truncate_index();
@@ -819,7 +829,7 @@ impl<'a> ProgramState<'a>
     {
         if !self.lines[self.cursor.line].move_down(&mut self.cursor.value)
         {
-            if self.cursor.line < self.lines.len() - 1
+            if self.cursor.value.follow.is_none() && self.cursor.line < self.lines.len() - 1
             {
                 self.cursor.line += 1;
                 self.truncate_index();
@@ -831,6 +841,7 @@ impl<'a> ProgramState<'a>
         &self,
         width: u32,
         height: u32,
+        _highlight: impl FnMut(Rect),
         f: impl Fn(RenderValue) -> RenderResult,
         renderer: impl FnMut(&RenderValue)
     )
@@ -842,7 +853,13 @@ impl<'a> ProgramState<'a>
                 let cursor = (self.cursor.line == index).then_some(&self.cursor.value);
 
                 let y = acc.rect.y + acc.rect.height as i32;
-                acc.combine_vertical(line.render(cursor, 0, y, &f))
+                let mut rendered = line.render(cursor, 0, y, &f);
+
+                let diff = y - rendered.rect.y;
+
+                rendered.shift(0, diff);
+
+                acc.combine(rendered)
             });
 
         let center = |size, start, other_size|
@@ -884,10 +901,16 @@ fn main()
         canvas.set_draw_color(Color::RGB(255, 255, 255));
         canvas.clear();
 
-        canvas.set_draw_color(Color::RGB(0, 0, 0));
-
         let (width, height) = canvas.window().size();
-        state.render(width, height, |render|
+
+        let canvas = RefCell::new(canvas);
+
+        state.render(width, height, |rect|
+        {
+            canvas.borrow_mut().set_draw_color(Color::RGB(200, 200, 200));
+
+            canvas.borrow_mut().fill_rect(rect).unwrap();
+        }, |render|
         {
             let rect = match render
             {
@@ -911,6 +934,8 @@ fn main()
             RenderResult::new(rect.into(), render)
         }, |render|
         {
+            canvas.borrow_mut().set_draw_color(Color::RGB(0, 0, 0));
+
             match render
             {
                 RenderValue::Text{x, y, text: value} =>
@@ -919,18 +944,18 @@ fn main()
                     let texture = Texture::from_surface(&text, creator).unwrap();
 
                     let rect = Rect::new(*x, *y, text.width(), text.height());
-                    canvas.copy(&texture, None, rect).unwrap();
+                    canvas.borrow_mut().copy(&texture, None, rect).unwrap();
                 },
                 RenderValue::Line{x, y, width} =>
                 {
                     let height = 2;
                     let rect = Rect::new(*x, y - height as i32 / 2, *width, height);
-                    canvas.fill_rect(rect).unwrap();
+                    canvas.borrow_mut().fill_rect(rect).unwrap();
                 },
                 RenderValue::Cursor{x, y} =>
                 {
                     let cursor_height = FONT_SIZE;
-                    canvas.fill_rect(Rect::new(
+                    canvas.borrow_mut().fill_rect(Rect::new(
                         *x,
                         *y,
                         4,
@@ -940,7 +965,7 @@ fn main()
             }
         });
 
-        canvas.present();
+        canvas.borrow_mut().present();
     }
 
     let ttf_ctx = sdl2::ttf::init().unwrap();
